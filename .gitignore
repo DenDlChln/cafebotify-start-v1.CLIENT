@@ -1,5 +1,15 @@
+# secrets / configs
 config.json
 .env
+
+# python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .venv/
+venv/
+.envrc
+
+# OS
+.DS_Store
