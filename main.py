@@ -20,6 +20,7 @@ from aiogram.types import (
     KeyboardButton,
     BotCommand,
     ChatMemberUpdated,
+    ErrorEvent,
 )
 from aiogram.filters import CommandStart, Command, StateFilter, CommandObject
 from aiogram.client.default import DefaultBotProperties
@@ -144,14 +145,26 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "cafebot123")
 HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 PORT = int(os.getenv("PORT", 10000))
 
-if not HOSTNAME:
-    HOSTNAME = "localhost"
-
 WEBHOOK_PATH = f"/{WEBHOOK_SECRET}/webhook"
-WEBHOOK_URL = f"https://{HOSTNAME}{WEBHOOK_PATH}"
+
+# Важно: если HOSTNAME не задан (локально) — webhook URL не ставим (будет polling/local)
+WEBHOOK_URL = f"https://{HOSTNAME}{WEBHOOK_PATH}" if HOSTNAME else None
 
 router = Router()
 
+
+# -------------------------
+# Global error handler (fix #1)
+# -------------------------
+
+@router.error()
+async def on_error(event: ErrorEvent):
+    logger.critical("UNHANDLED ERROR in handler: %r", event.exception, exc_info=True)  # [web:204]
+
+
+# -------------------------
+# FSM
+# -------------------------
 
 class OrderStates(StatesGroup):
     waiting_for_quantity = State()
@@ -317,17 +330,17 @@ CHOICE_VARIANTS = [
     "Отличный выбор! Такое сейчас особенно популярно.",
     "Классика, которая никогда не подводит.",
     "Мне тоже нравится этот вариант — не прогадаешь.",
-    "Прекрасный вкус, {name}! Это один из хитов нашего меню.",
-    "Вот это да, {name}! Любители хорошего кофе тебя поймут.",
+    "Прекрасный вкус! Это один из хитов нашего меню.",
+    "Любители хорошего кофе тебя поймут!",
     "Смело! Такой выбор обычно делают настоящие ценители.",
-    "{name}, ты знаешь толк в напитках.",
+    "Хороший выбор, ты знаешь толк в напитках.",
     "Звучит вкусно — уже представляю аромат.",
 ]
 
 FINISH_VARIANTS = [
     "Спасибо за заказ! Буду рад увидеть тебя снова.",
     "Рад был помочь с выбором. Заглядывай ещё — всегда ждём.",
-    "Отличный заказ! Надеюсь, это сделает день чуточку лучше.",
+    "Отличный заказ! Надеюсь, это сделает твой день чуточку лучше.",
     "Спасибо, что выбрал именно нас. До следующей кофейной паузы!",
     "Заказ готовим с заботой. Возвращайся, когда захочется повторить.",
 ]
@@ -352,6 +365,15 @@ def get_closed_message(cafe: Dict[str, Any]) -> str:
 
 def is_admin_of_cafe(user_id: int, cafe: Dict[str, Any]) -> bool:
     return user_id == int(cafe["admin_chat_id"]) or (SUPERADMIN_ID and user_id == SUPERADMIN_ID)
+
+
+# -------------------------
+# Debug command (fix #2 verification)
+# -------------------------
+
+@router.message(Command("ping"))
+async def ping(message: Message):
+    await message.answer("pong")
 
 
 # -------------------------
@@ -416,28 +438,25 @@ async def send_admin_start_screen(message: Message, cafe: Dict[str, Any]):
 
 
 # -------------------------
-# User flow
+# START handlers (fix #3)
 # -------------------------
 
-@router.message(CommandStart(deep_link=True))
-async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
+async def _start_common(message: Message, state: FSMContext, incoming_cafe_id: Optional[str]):
     await state.clear()
-
     user_id = message.from_user.id
-    incoming = (command.args or "").strip() or None
 
-    if incoming:
-        if incoming not in CAFES_BY_ID:
+    if incoming_cafe_id:
+        if incoming_cafe_id not in CAFES_BY_ID:
             await message.answer("Ссылка устарела или кафе не найдено. Попросите актуальную ссылку у заведения.")
             return
-        await set_user_cafe_id(user_id, incoming)
-        cafe = CAFES_BY_ID[incoming]
+        await set_user_cafe_id(user_id, incoming_cafe_id)
+        cafe = CAFES_BY_ID[incoming_cafe_id]
     else:
         cafe = await get_cafe_for_user(user_id)
         if not await get_user_cafe_id(user_id):
             await set_user_cafe_id(user_id, cafe["id"])
 
-    logger.info(f"👤 /start user={user_id} cafe={cafe['id']} is_admin={is_admin_of_cafe(user_id, cafe)} args={command.args}")
+    logger.info(f"👤 /start user={user_id} cafe={cafe['id']} incoming={incoming_cafe_id}")
 
     if is_admin_of_cafe(user_id, cafe):
         await send_admin_start_screen(message, cafe)
@@ -460,6 +479,21 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         await message.answer(get_closed_message(cafe), reply_markup=create_info_keyboard())
 
 
+@router.message(CommandStart(deep_link=True))
+async def start_with_payload(message: Message, command: CommandObject, state: FSMContext):
+    incoming = (command.args or "").strip() or None  # payload из ?start=... [web:46]
+    await _start_common(message, state, incoming)
+
+
+@router.message(CommandStart())
+async def start_plain(message: Message, state: FSMContext):
+    await _start_common(message, state, None)
+
+
+# -------------------------
+# Admin buttons
+# -------------------------
+
 @router.message(F.text == "🛠 Админ")
 async def admin_button(message: Message):
     cafe = await get_cafe_for_user(message.from_user.id)
@@ -471,24 +505,7 @@ async def admin_button(message: Message):
 
 @router.message(F.text == "☕ Открыть меню")
 async def open_menu_as_guest(message: Message, state: FSMContext):
-    await state.clear()
-    cafe = await get_cafe_for_user(message.from_user.id)
-
-    name = get_user_name(message)
-    msk_time = get_moscow_time().strftime("%H:%M")
-    welcome = random.choice(WELCOME_VARIANTS).format(name=name)
-
-    if is_cafe_open(cafe):
-        await message.answer(
-            f"{welcome}\n\n"
-            f"🏪 <b>{cafe['name']}</b>\n"
-            f"🕐 <i>Московское время: {msk_time}</i>\n"
-            f"🏪 {get_work_status(cafe)}\n\n"
-            f"☕ <b>Выберите напиток:</b>",
-            reply_markup=create_menu_keyboard(cafe),
-        )
-    else:
-        await message.answer(get_closed_message(cafe), reply_markup=create_info_keyboard())
+    await _start_common(message, state, None)
 
 
 @router.message(F.text == "🔗 Мои ссылки")
@@ -507,7 +524,7 @@ async def group_help_button(message: Message):
         await message.answer("Доступно только администратору кафе.")
         return
 
-    staff_link = await create_startgroup_link(message.bot, payload=cafe["id"], encode=False)
+    staff_link = await create_startgroup_link(message.bot, payload=cafe["id"], encode=False)  # [web:46]
     text = (
         "👥 <b>Подключение группы персонала</b>\n\n"
         "1) Создайте группу (например “Кафе — персонал”).\n"
@@ -746,29 +763,14 @@ async def links_command(message: Message):
 
     parts = ["🔗 <b>Ссылки всех кафе</b>\n"]
     for cafe in CAFES:
-        guest_link = await create_start_link(message.bot, payload=cafe["id"], encode=False)
-        staff_link = await create_startgroup_link(message.bot, payload=cafe["id"], encode=False)
+        guest_link = await create_start_link(message.bot, payload=cafe["id"], encode=False)  # [web:46]
+        staff_link = await create_startgroup_link(message.bot, payload=cafe["id"], encode=False)  # [web:46]
         parts.append(
             f"<b>{cafe['name']}</b> (id={cafe['id']}):\n"
             f"Гости: {guest_link}\n"
             f"Персонал: {staff_link}\n"
         )
-
     await message.answer("\n".join(parts), disable_web_page_preview=True)
-
-
-@router.message(Command("help"))
-async def help_command(message: Message):
-    await message.answer(
-        "CafeBotify.\n\n"
-        "Гости: оформляйте заказ через меню.\n"
-        "Админы: добавьте бота в группу персонала и выполните /bind.\n"
-    )
-
-
-@router.message(Command("myid"))
-async def myid(message: Message):
-    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
 
 
 # -------------------------
@@ -778,6 +780,7 @@ async def myid(message: Message):
 async def set_bot_commands(bot: Bot) -> None:
     commands = [
         BotCommand(command="start", description="Запуск бота"),
+        BotCommand(command="ping", description="Проверка (pong)"),
         BotCommand(command="myid", description="Показать мой Telegram ID"),
         BotCommand(command="stats", description="Статистика (админ)"),
         BotCommand(command="bind", description="Привязать группу к кафе (в группе)"),
@@ -786,13 +789,19 @@ async def set_bot_commands(bot: Bot) -> None:
     await bot.set_my_commands(commands)
 
 
+@router.message(Command("myid"))
+async def myid(message: Message):
+    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
+
+
 async def on_startup(bot: Bot) -> None:
-    logger.info("=== BUILD MARK: MULTI-CAFE MAIN v1 ===")
-    logger.info("🚀 Startup (MULTI-CAFE)...")
+    logger.info("=== BUILD MARK: MULTI-CAFE MAIN v2 (start fixes + error handler) ===")
     logger.info(f"🏪 Cafes loaded: {len(CAFES)}")
     for c in CAFES:
         logger.info(f"CFG cafe={c['id']} admin={c['admin_chat_id']}")
-    logger.info(f"🔗 Webhook target: {WEBHOOK_URL}")
+
+    if WEBHOOK_URL:
+        logger.info(f"🔗 Webhook target: {WEBHOOK_URL}")
 
     try:
         r_test = redis.from_url(REDIS_URL)
@@ -803,21 +812,25 @@ async def on_startup(bot: Bot) -> None:
         logger.error(f"❌ Redis error: {e}")
 
     try:
-        await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
-        logger.info("✅ Webhook set")
-    except Exception as e:
-        logger.error(f"❌ Webhook error: {e}")
-
-    try:
         await set_bot_commands(bot)
         logger.info("✅ Commands set")
     except Exception as e:
         logger.error(f"❌ set_my_commands error: {e}")
 
+    # В webhook-режиме ставим webhook только если есть внешний hostname (Render)
+    if WEBHOOK_URL:
+        try:
+            await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
+            logger.info("✅ Webhook set")
+        except Exception as e:
+            logger.error(f"❌ Webhook error: {e}")
+    else:
+        logger.warning("⚠️ WEBHOOK_URL is None (no RENDER_EXTERNAL_HOSTNAME). Webhook not set.")
+
     try:
         for cafe in CAFES:
-            guest = await create_start_link(bot, payload=cafe["id"], encode=False)
-            staff = await create_startgroup_link(bot, payload=cafe["id"], encode=False)
+            guest = await create_start_link(bot, payload=cafe["id"], encode=False)  # [web:46]
+            staff = await create_startgroup_link(bot, payload=cafe["id"], encode=False)  # [web:46]
             logger.info(f"LINK guest [{cafe['id']}]: {guest}")
             logger.info(f"LINK staff  [{cafe['id']}]: {staff}")
     except Exception as e:
@@ -845,6 +858,7 @@ async def main():
 
     app.router.add_get("/", healthcheck)
 
+    # Webhook handler for Telegram updates [web:38]
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
@@ -873,10 +887,10 @@ async def main():
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
     await site.start()
 
-    logger.info(f"🌐 Server running on 0.0.0.0:{PORT}")
+    logger.info(f"🌐 Server running on 0.0.0.0:{os.getenv('PORT','10000')}")
     await asyncio.Event().wait()
 
 
