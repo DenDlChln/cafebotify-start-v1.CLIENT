@@ -46,16 +46,39 @@ def get_moscow_time() -> datetime:
 
 
 # -------------------------
-# Config (multi-cafe)
+# CONFIG (multi-cafe) + DIAGNOSTIC
 # -------------------------
 
 def load_config_file() -> Dict[str, Any]:
+    """
+    DIAGNOSTIC INCLUDED:
+    - CONFIG_PATH
+    - CWD
+    - DIR listing
+    - exact error message
+    """
     path = os.getenv("CONFIG_PATH", "config.json")
+
+    # ---- DIAGNOSTIC (пункт 1) ----
+    logger.info(f"CONFIG_PATH={path}")
+    try:
+        logger.info(f"CWD={os.getcwd()}")
+    except Exception as e:
+        logger.info(f"CWD error: {e}")
+
+    try:
+        logger.info("DIR=" + ", ".join(os.listdir(".")))
+    except Exception as e:
+        logger.info(f"DIR list error: {e}")
+    # ------------------------------
+
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+            cafes_count = len(data.get("cafes", [])) if isinstance(data, dict) else "n/a"
+            logger.info(f"CONFIG loaded cafes={cafes_count}")
             if not isinstance(data, dict):
-                raise ValueError("config root must be object")
+                raise ValueError("config root must be object/dict")
             return data
     except FileNotFoundError as e:
         logger.error(f"❌ CONFIG not found: {e}")
@@ -63,10 +86,12 @@ def load_config_file() -> Dict[str, Any]:
         logger.error(f"❌ CONFIG JSON invalid: {e}")
     except Exception as e:
         logger.error(f"❌ CONFIG load error: {e}")
+
     return {}
 
 
 CONFIG = load_config_file()
+
 CAFES = CONFIG.get("cafes", [])
 if not isinstance(CAFES, list):
     CAFES = []
@@ -111,7 +136,7 @@ SUPERADMIN_ID = int(CONFIG.get("superadmin_id") or 0)
 
 
 # -------------------------
-# Env / Webhook
+# ENV / WEBHOOK
 # -------------------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -126,7 +151,6 @@ if not HOSTNAME:
 WEBHOOK_PATH = f"/{WEBHOOK_SECRET}/webhook"
 WEBHOOK_URL = f"https://{HOSTNAME}{WEBHOOK_PATH}"
 
-
 router = Router()
 
 
@@ -136,7 +160,7 @@ class OrderStates(StatesGroup):
 
 
 # -------------------------
-# Helpers (redis keys)
+# Redis helpers
 # -------------------------
 
 async def get_redis_client():
@@ -415,7 +439,7 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         if not await get_user_cafe_id(user_id):
             await set_user_cafe_id(user_id, cafe["id"])
 
-    logger.info(f"👤 /start от {user_id} | cafe={cafe['id']} | is_admin={is_admin_of_cafe(user_id, cafe)}")
+    logger.info(f"👤 /start user={user_id} cafe={cafe['id']} is_admin={is_admin_of_cafe(user_id, cafe)} args={command.args}")
 
     if is_admin_of_cafe(user_id, cafe):
         await send_admin_start_screen(message, cafe)
@@ -658,18 +682,18 @@ async def call_phone(message: Message):
     name = get_user_name(message)
 
     if is_cafe_open(cafe):
-        text = (
+        await message.answer(
             f"{name}, буду рад помочь!\n\n"
-            f"📞 <b>Телефон {cafe['name']}:</b>\n<code>{cafe['phone']}</code>\n"
+            f"📞 <b>Телефон {cafe['name']}:</b>\n<code>{cafe['phone']}</code>\n",
+            reply_markup=create_menu_keyboard(cafe),
         )
-        await message.answer(text, reply_markup=create_menu_keyboard(cafe))
     else:
-        text = (
+        await message.answer(
             f"{name}, сейчас мы закрыты.\n\n"
             f"📞 <b>Телефон {cafe['name']}:</b>\n<code>{cafe['phone']}</code>\n\n"
-            f"⏰ {get_work_status(cafe)}\n"
+            f"⏰ {get_work_status(cafe)}\n",
+            reply_markup=create_info_keyboard(),
         )
-        await message.answer(text, reply_markup=create_info_keyboard())
 
 
 @router.message(F.text == "⏰ Часы работы")
@@ -678,17 +702,17 @@ async def show_hours(message: Message):
     name = get_user_name(message)
     msk_time = get_moscow_time().strftime("%H:%M")
 
-    text = (
+    await message.answer(
         f"{name}, вот режим работы:\n\n"
         f"🕐 <b>Сейчас:</b> {msk_time} (МСК)\n"
         f"🏪 {get_work_status(cafe)}\n\n"
-        f"📞 Телефон: <code>{cafe['phone']}</code>\n"
+        f"📞 Телефон: <code>{cafe['phone']}</code>\n",
+        reply_markup=create_menu_keyboard(cafe) if is_cafe_open(cafe) else create_info_keyboard(),
     )
-    await message.answer(text, reply_markup=create_menu_keyboard(cafe) if is_cafe_open(cafe) else create_info_keyboard())
 
 
 # -------------------------
-# Stats / links / help / myid
+# Commands
 # -------------------------
 
 @router.message(Command("stats"))
@@ -731,12 +755,11 @@ async def links_command(message: Message):
 
 @router.message(Command("help"))
 async def help_command(message: Message):
-    text = (
+    await message.answer(
         "CafeBotify.\n\n"
         "Гости: оформляйте заказ через меню.\n"
         "Админы: добавьте бота в группу персонала и выполните /bind.\n"
     )
-    await message.answer(text)
 
 
 @router.message(Command("myid"))
@@ -782,7 +805,7 @@ async def on_startup(bot: Bot) -> None:
 
     try:
         await set_bot_commands(bot)
-        logger.info("✅ Commands set (no /help in menu)")
+        logger.info("✅ Commands set")
     except Exception as e:
         logger.error(f"❌ set_my_commands error: {e}")
 
