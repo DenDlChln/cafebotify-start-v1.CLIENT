@@ -51,13 +51,6 @@ def get_moscow_time() -> datetime:
 # -------------------------
 
 def load_config_file() -> Dict[str, Any]:
-    """
-    Reads CONFIG_PATH (default: config.json) and prints diagnostics:
-    - CONFIG_PATH
-    - CWD
-    - DIR listing
-    - exact error message
-    """
     path = os.getenv("CONFIG_PATH", "config.json")
 
     logger.info("=== IMPORT MARK: MULTI-CAFE DIAG LOADED ===")
@@ -146,20 +139,18 @@ HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 PORT = int(os.getenv("PORT", 10000))
 
 WEBHOOK_PATH = f"/{WEBHOOK_SECRET}/webhook"
-
-# Важно: если HOSTNAME не задан (локально) — webhook URL не ставим (будет polling/local)
 WEBHOOK_URL = f"https://{HOSTNAME}{WEBHOOK_PATH}" if HOSTNAME else None
 
 router = Router()
 
 
 # -------------------------
-# Global error handler (fix #1)
+# Global error handler
 # -------------------------
 
 @router.error()
 async def on_error(event: ErrorEvent):
-    logger.critical("UNHANDLED ERROR in handler: %r", event.exception, exc_info=True)  # [web:204]
+    logger.critical("UNHANDLED ERROR in handler: %r", event.exception, exc_info=True)
 
 
 # -------------------------
@@ -263,27 +254,28 @@ def get_work_status(cafe: Dict[str, Any]) -> str:
 
 
 # -------------------------
-# Keyboards
+# Keyboards (FIX #2: убрана кнопка Админ для посетителей)
 # -------------------------
 
 def create_menu_keyboard(cafe: Dict[str, Any]) -> ReplyKeyboardMarkup:
+    """Меню для посетителей (БЕЗ кнопки Админ)"""
     keyboard = [[KeyboardButton(text=drink)] for drink in cafe["menu"].keys()]
     keyboard.append([KeyboardButton(text="📞 Позвонить"), KeyboardButton(text="⏰ Часы работы")])
-    keyboard.append([KeyboardButton(text="🛠 Админ")])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
 def create_info_keyboard() -> ReplyKeyboardMarkup:
+    """Меню когда закрыто (БЕЗ кнопки Админ)"""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📞 Позвонить"), KeyboardButton(text="⏰ Часы работы")],
-            [KeyboardButton(text="🛠 Админ")],
         ],
         resize_keyboard=True,
     )
 
 
 def create_admin_keyboard() -> ReplyKeyboardMarkup:
+    """Меню для админа"""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔗 Мои ссылки")],
@@ -330,17 +322,17 @@ CHOICE_VARIANTS = [
     "Отличный выбор! Такое сейчас особенно популярно.",
     "Классика, которая никогда не подводит.",
     "Мне тоже нравится этот вариант — не прогадаешь.",
-    "Прекрасный вкус! Это один из хитов нашего меню.",
-    "Любители хорошего кофе тебя поймут!",
+    "Прекрасный вкус, {name}! Это один из хитов нашего меню.",
+    "Вот это да, {name}! Любители хорошего кофе тебя поймут.",
     "Смело! Такой выбор обычно делают настоящие ценители.",
-    "Хороший выбор, ты знаешь толк в напитках.",
+    "{name}, ты знаешь толк в напитках.",
     "Звучит вкусно — уже представляю аромат.",
 ]
 
 FINISH_VARIANTS = [
     "Спасибо за заказ! Буду рад увидеть тебя снова.",
     "Рад был помочь с выбором. Заглядывай ещё — всегда ждём.",
-    "Отличный заказ! Надеюсь, это сделает твой день чуточку лучше.",
+    "Отличный заказ! Надеюсь, это сделает день чуточку лучше.",
     "Спасибо, что выбрал именно нас. До следующей кофейной паузы!",
     "Заказ готовим с заботой. Возвращайся, когда захочется повторить.",
 ]
@@ -368,7 +360,7 @@ def is_admin_of_cafe(user_id: int, cafe: Dict[str, Any]) -> bool:
 
 
 # -------------------------
-# Debug command (fix #2 verification)
+# Debug command
 # -------------------------
 
 @router.message(Command("ping"))
@@ -438,7 +430,7 @@ async def send_admin_start_screen(message: Message, cafe: Dict[str, Any]):
 
 
 # -------------------------
-# START handlers (fix #3)
+# START handlers
 # -------------------------
 
 async def _start_common(message: Message, state: FSMContext, incoming_cafe_id: Optional[str]):
@@ -481,7 +473,7 @@ async def _start_common(message: Message, state: FSMContext, incoming_cafe_id: O
 
 @router.message(CommandStart(deep_link=True))
 async def start_with_payload(message: Message, command: CommandObject, state: FSMContext):
-    incoming = (command.args or "").strip() or None  # payload из ?start=... [web:46]
+    incoming = (command.args or "").strip() or None
     await _start_common(message, state, incoming)
 
 
@@ -491,21 +483,32 @@ async def start_plain(message: Message, state: FSMContext):
 
 
 # -------------------------
-# Admin buttons
+# Admin buttons (FIX #1: правильно показывает меню)
 # -------------------------
-
-@router.message(F.text == "🛠 Админ")
-async def admin_button(message: Message):
-    cafe = await get_cafe_for_user(message.from_user.id)
-    if not is_admin_of_cafe(message.from_user.id, cafe):
-        await message.answer("Доступно только администратору кафе.")
-        return
-    await send_admin_start_screen(message, cafe)
-
 
 @router.message(F.text == "☕ Открыть меню")
 async def open_menu_as_guest(message: Message, state: FSMContext):
-    await _start_common(message, state, None)
+    """
+    FIX #1: у админа теперь правильно открывается меню его кафе
+    """
+    await state.clear()
+    cafe = await get_cafe_for_user(message.from_user.id)
+
+    name = get_user_name(message)
+    msk_time = get_moscow_time().strftime("%H:%M")
+    welcome = random.choice(WELCOME_VARIANTS).format(name=name)
+
+    if is_cafe_open(cafe):
+        await message.answer(
+            f"{welcome}\n\n"
+            f"🏪 <b>{cafe['name']}</b>\n"
+            f"🕐 <i>Московское время: {msk_time}</i>\n"
+            f"🏪 {get_work_status(cafe)}\n\n"
+            f"☕ <b>Выберите напиток:</b>",
+            reply_markup=create_menu_keyboard(cafe),
+        )
+    else:
+        await message.answer(get_closed_message(cafe), reply_markup=create_info_keyboard())
 
 
 @router.message(F.text == "🔗 Мои ссылки")
@@ -524,10 +527,10 @@ async def group_help_button(message: Message):
         await message.answer("Доступно только администратору кафе.")
         return
 
-    staff_link = await create_startgroup_link(message.bot, payload=cafe["id"], encode=False)  # [web:46]
+    staff_link = await create_startgroup_link(message.bot, payload=cafe["id"], encode=False)
     text = (
         "👥 <b>Подключение группы персонала</b>\n\n"
-        "1) Создайте группу (например “Кафе — персонал”).\n"
+        "1) Создайте группу (например "Кафе — персонал").\n"
         "2) Добавьте туда бота по ссылке:\n"
         f"{staff_link}\n\n"
         f"3) В группе напишите:\n<code>/bind {cafe['id']}</code>\n"
@@ -541,8 +544,18 @@ async def stats_button(message: Message):
 
 
 # -------------------------
-# Ordering
+# Ordering (FIX #3: emoji → int)
 # -------------------------
+
+# Маппинг emoji-кнопок на числа
+QUANTITY_MAP = {
+    "1️⃣": 1,
+    "2️⃣": 2,
+    "3️⃣": 3,
+    "4️⃣": 4,
+    "5️⃣": 5,
+}
+
 
 @router.message(F.text)
 async def drink_selected(message: Message, state: FSMContext):
@@ -575,6 +588,9 @@ async def drink_selected(message: Message, state: FSMContext):
 
 @router.message(StateFilter(OrderStates.waiting_for_quantity))
 async def process_quantity(message: Message, state: FSMContext):
+    """
+    FIX #3: правильный парсинг emoji-кнопок
+    """
     cafe = await get_cafe_for_user(message.from_user.id)
 
     if message.text == "🔙 Отмена":
@@ -585,23 +601,21 @@ async def process_quantity(message: Message, state: FSMContext):
         )
         return
 
-    try:
-        quantity = int(message.text[0])
-        if 1 <= quantity <= 5:
-            data = await state.get_data()
-            drink, price = data["drink"], int(data["price"])
-            total = price * quantity
+    # Парсинг emoji → число
+    quantity = QUANTITY_MAP.get(message.text)
+    if quantity:
+        data = await state.get_data()
+        drink, price = data["drink"], int(data["price"])
+        total = price * quantity
 
-            await state.set_state(OrderStates.waiting_for_confirmation)
-            await state.update_data(quantity=quantity, total=total)
+        await state.set_state(OrderStates.waiting_for_confirmation)
+        await state.update_data(quantity=quantity, total=total)
 
-            await message.answer(
-                f"🥤 <b>{drink}</b> × {quantity}\n💰 Итого: <b>{total} ₽</b>\n\n✅ Правильно?",
-                reply_markup=create_confirm_keyboard(),
-            )
-        else:
-            await message.answer("❌ Выберите от 1 до 5", reply_markup=create_quantity_keyboard())
-    except ValueError:
+        await message.answer(
+            f"🥤 <b>{drink}</b> × {quantity}\n💰 Итого: <b>{total} ₽</b>\n\n✅ Правильно?",
+            reply_markup=create_confirm_keyboard(),
+        )
+    else:
         await message.answer("❌ Нажмите на кнопку", reply_markup=create_quantity_keyboard())
 
 
@@ -763,14 +777,19 @@ async def links_command(message: Message):
 
     parts = ["🔗 <b>Ссылки всех кафе</b>\n"]
     for cafe in CAFES:
-        guest_link = await create_start_link(message.bot, payload=cafe["id"], encode=False)  # [web:46]
-        staff_link = await create_startgroup_link(message.bot, payload=cafe["id"], encode=False)  # [web:46]
+        guest_link = await create_start_link(message.bot, payload=cafe["id"], encode=False)
+        staff_link = await create_startgroup_link(message.bot, payload=cafe["id"], encode=False)
         parts.append(
             f"<b>{cafe['name']}</b> (id={cafe['id']}):\n"
             f"Гости: {guest_link}\n"
             f"Персонал: {staff_link}\n"
         )
     await message.answer("\n".join(parts), disable_web_page_preview=True)
+
+
+@router.message(Command("myid"))
+async def myid(message: Message):
+    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
 
 
 # -------------------------
@@ -789,13 +808,8 @@ async def set_bot_commands(bot: Bot) -> None:
     await bot.set_my_commands(commands)
 
 
-@router.message(Command("myid"))
-async def myid(message: Message):
-    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
-
-
 async def on_startup(bot: Bot) -> None:
-    logger.info("=== BUILD MARK: MULTI-CAFE MAIN v2 (start fixes + error handler) ===")
+    logger.info("=== BUILD MARK: MULTI-CAFE MAIN v3 (fix menu+admin btn+emoji quantity) ===")
     logger.info(f"🏪 Cafes loaded: {len(CAFES)}")
     for c in CAFES:
         logger.info(f"CFG cafe={c['id']} admin={c['admin_chat_id']}")
@@ -817,7 +831,6 @@ async def on_startup(bot: Bot) -> None:
     except Exception as e:
         logger.error(f"❌ set_my_commands error: {e}")
 
-    # В webhook-режиме ставим webhook только если есть внешний hostname (Render)
     if WEBHOOK_URL:
         try:
             await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
@@ -829,8 +842,8 @@ async def on_startup(bot: Bot) -> None:
 
     try:
         for cafe in CAFES:
-            guest = await create_start_link(bot, payload=cafe["id"], encode=False)  # [web:46]
-            staff = await create_startgroup_link(bot, payload=cafe["id"], encode=False)  # [web:46]
+            guest = await create_start_link(bot, payload=cafe["id"], encode=False)
+            staff = await create_startgroup_link(bot, payload=cafe["id"], encode=False)
             logger.info(f"LINK guest [{cafe['id']}]: {guest}")
             logger.info(f"LINK staff  [{cafe['id']}]: {staff}")
     except Exception as e:
@@ -858,7 +871,6 @@ async def main():
 
     app.router.add_get("/", healthcheck)
 
-    # Webhook handler for Telegram updates [web:38]
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
@@ -887,10 +899,10 @@ async def main():
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-    logger.info(f"🌐 Server running on 0.0.0.0:{os.getenv('PORT','10000')}")
+    logger.info(f"🌐 Server running on 0.0.0.0:{PORT}")
     await asyncio.Event().wait()
 
 
